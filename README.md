@@ -18,7 +18,7 @@
 
 ## 🏗️ 系统架构
 系统采用“端—云—边”三层协同架构：端侧完成图像采集、人脸检测、多目标跟踪与跨模态身份识别；云侧负责视频转发、低时延数据中继与实时告警服务；客户端提供实时预览、远程布控、人脸库管理和告警联动。
-![image-20260917175947888](X:\Users\Hofg Jise\AppData\Roaming\Typora\typora-user-images\image-20260917175947888.png)
+![系统架构图](./images/system-architecture.png)
 
 ## 📂 目录结构
 
