@@ -1,0 +1,27 @@
+# 核心框架
+pytorch-lightning==1.8.6
+torch==1.13.1
+torchvision==0.14.1
+tqdm==4.60.0
+
+# 数据处理与科学计算
+numpy==1.23.5
+scipy==1.10.1
+Pillow==9.5.0
+h5py==3.8.0
+matplotlib==3.7.1
+opencv-python==4.7.0.72
+scikit-learn==1.2.2
+
+# 人脸/图像相关
+menpo
+bcolz-zipline
+prettytable
+
+# 可视化与日志
+dominate>=2.4.0
+visdom>=0.1.8.8
+wandb>=0.15.0
+
+# 可选：mxnet 与 PyTorch 可能冲突，建议按需安装
+# mxnet

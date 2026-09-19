@@ -1,0 +1,336 @@
+
+//
+// Copyright (c) 2013-2025 Winlin
+//
+// SPDX-License-Identifier: MIT
+//
+
+'use strict';
+
+function SrsError(name, message) {
+    this.name = name;
+    this.message = message;
+    this.stack = (new Error()).stack;
+}
+SrsError.prototype = Object.create(Error.prototype);
+SrsError.prototype.constructor = SrsError;
+
+// Depends on adapter-7.4.0.min.js from https://github.com/webrtc/adapter
+// Async-awat-prmise based SRS RTC Publisher by WHIP.
+function SrsRtcWhipWhepAsync() {
+    var self = {};
+
+    // https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia
+    self.constraints = {
+        audio: true,
+        video: {
+            width: {ideal: 320, max: 720},
+            //width: {ideal: 720, max: 1080},
+            //width: 1280, height: 720, frameRate: 30,
+        }
+    };
+
+    // Store media streams to stop tracks when closing.
+    self.displayStream = null;
+    self.userStream = null;
+
+    // Store the WHIP session resource URL from Location header for cleanup.
+    self.resourceUrl = null;
+
+    // See https://datatracker.ietf.org/doc/draft-ietf-wish-whip/
+    // @url The WebRTC url to publish with, for example:
+    //      http://localhost:1985/rtc/v1/whip/?app=live&stream=livestream
+    // @options The options to control playing, supports:
+    //      camera: boolean, whether capture video from camera, default to true.
+    //      screen: boolean, whether capture video from screen, default to false.
+    //      audio: boolean, whether play audio, default to true.
+    //      vcodec: string, video codec to use (e.g., 'h264', 'vp9', 'av1'), default to undefined.
+    //      acodec: string, audio codec to use (e.g., 'opus', 'pcmu', 'pcma'), default to undefined.
+    self.publish = async function (url, options) {
+        if (url.indexOf('/whip/') === -1) throw new Error(`invalid WHIP url ${url}`);
+        const hasAudio = options?.audio ?? true;
+        const useCamera = options?.camera ?? true;
+        const useScreen = options?.screen ?? false;
+        const vcodec = options?.vcodec;
+        const acodec = options?.acodec;
+
+        if (!hasAudio && !useCamera && !useScreen) throw new Error(`The camera, screen and audio can't be false at the same time`);
+
+        if (hasAudio) {
+            self.pc.addTransceiver("audio", {direction: "sendonly"});
+        } else {
+            self.constraints.audio = false;
+        }
+
+        if (useCamera || useScreen) {
+            self.pc.addTransceiver("video", {direction: "sendonly"});
+        }
+
+        if (!useCamera) {
+            self.constraints.video = false;
+        }
+
+        if (!navigator.mediaDevices && window.location.protocol === 'http:' && window.location.hostname !== 'localhost') {
+            throw new SrsError('HttpsRequiredError', `Please use HTTPS or localhost to publish, read https://github.com/ossrs/srs/issues/2762#issuecomment-983147576`);
+        }
+
+        if (useScreen) {
+            self.displayStream = await navigator.mediaDevices.getDisplayMedia({
+                video: true
+            });
+            // @see https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/addStream#Migrating_to_addTrack
+            self.displayStream.getTracks().forEach(function (track) {
+                self.pc.addTrack(track);
+				// Notify about local track when stream is ok.
+                self.ontrack && self.ontrack({track: track});
+            });
+        }
+
+       if (useCamera || hasAudio) {
+            self.userStream = await navigator.mediaDevices.getUserMedia(self.constraints);
+
+            self.userStream.getTracks().forEach(function (track) {
+                self.pc.addTrack(track);
+                // Notify about local track when stream is ok.
+                self.ontrack && self.ontrack({track: track});
+            });
+       }
+
+        var offer = await self.pc.createOffer();
+        await self.pc.setLocalDescription(offer);
+
+        // Filter codecs if specified
+        if (vcodec || acodec) {
+            offer.sdp = self.__internal.filterCodec(offer.sdp, vcodec, acodec);
+            console.log(`Filtered codecs (vcodec=${vcodec}, acodec=${acodec}): ${offer.sdp}`);
+        }
+
+        const answer = await new Promise(function (resolve, reject) {
+            console.log(`Generated offer: ${offer.sdp}`);
+
+            const xhr = new XMLHttpRequest();
+            xhr.onload = function() {
+                if (xhr.readyState !== xhr.DONE) return;
+                if (xhr.status !== 200 && xhr.status !== 201) return reject(xhr);
+                const data = xhr.responseText;
+                console.log("Got answer: ", data);
+
+                // Extract Location header for WHIP session resource URL.
+                const location = xhr.getResponseHeader('Location');
+                if (location) {
+                    self.resourceUrl = new URL(location, url).href;
+                    console.log(`WHIP session resource URL: ${self.resourceUrl}`);
+                }
+
+                return data.code ? reject(xhr) : resolve(data);
+            }
+            xhr.open('POST', url, true);
+            xhr.setRequestHeader('Content-type', 'application/sdp');
+            xhr.send(offer.sdp);
+        });
+        await self.pc.setRemoteDescription(
+            new RTCSessionDescription({type: 'answer', sdp: answer})
+        );
+
+        return self.__internal.parseId(url, offer.sdp, answer);
+    };
+
+    // See https://datatracker.ietf.org/doc/draft-ietf-wish-whip/
+    // @url The WebRTC url to play with, for example:
+    //      http://localhost:1985/rtc/v1/whep/?app=live&stream=livestream
+    // @options The options to control playing, supports:
+    //      videoOnly: boolean, whether only play video, default to false.
+    //      audioOnly: boolean, whether only play audio, default to false.
+    //      vcodec: string, video codec to use (e.g., 'h264', 'vp9', 'av1'), default to undefined.
+    //      acodec: string, audio codec to use (e.g., 'opus', 'pcmu', 'pcma'), default to undefined.
+    self.play = async function(url, options) {
+        if (url.indexOf('/whip-play/') === -1 && url.indexOf('/whep/') === -1) throw new Error(`invalid WHEP url ${url}`);
+        if (options?.videoOnly && options?.audioOnly) throw new Error(`The videoOnly and audioOnly in options can't be true at the same time`);
+        const vcodec = options?.vcodec;
+        const acodec = options?.acodec;
+
+        if (!options?.videoOnly) self.pc.addTransceiver("audio", {direction: "recvonly"});
+        if (!options?.audioOnly) self.pc.addTransceiver("video", {direction: "recvonly"});
+
+        var offer = await self.pc.createOffer();
+        await self.pc.setLocalDescription(offer);
+
+        // Filter codecs if specified
+        if (vcodec || acodec) {
+            offer.sdp = self.__internal.filterCodec(offer.sdp, vcodec, acodec);
+            console.log(`Filtered codecs (vcodec=${vcodec}, acodec=${acodec}): ${offer.sdp}`);
+        }
+
+        const answer = await new Promise(function(resolve, reject) {
+            console.log(`Generated offer: ${offer.sdp}`);
+
+            const xhr = new XMLHttpRequest();
+            xhr.onload = function() {
+                if (xhr.readyState !== xhr.DONE) return;
+                if (xhr.status !== 200 && xhr.status !== 201) return reject(xhr);
+                const data = xhr.responseText;
+                console.log("Got answer: ", data);
+
+                // Extract Location header for WHEP session resource URL.
+                const location = xhr.getResponseHeader('Location');
+                if (location) {
+                    self.resourceUrl = new URL(location, url).href;
+                    console.log(`WHEP session resource URL: ${self.resourceUrl}`);
+                }
+
+                return data.code ? reject(xhr) : resolve(data);
+            }
+            xhr.open('POST', url, true);
+            xhr.setRequestHeader('Content-type', 'application/sdp');
+            xhr.send(offer.sdp);
+        });
+        await self.pc.setRemoteDescription(
+            new RTCSessionDescription({type: 'answer', sdp: answer})
+        );
+
+        return self.__internal.parseId(url, offer.sdp, answer);
+    };
+
+    // Close the publisher.
+    self.close = function () {
+        self.pc && self.pc.close();
+        self.pc = null;
+
+        // Stop all media tracks to release camera/microphone.
+        if (self.displayStream) {
+            self.displayStream.getTracks().forEach(function (track) {
+                track.stop();
+            });
+            self.displayStream = null;
+        }
+        if (self.userStream) {
+            self.userStream.getTracks().forEach(function (track) {
+                track.stop();
+            });
+            self.userStream = null;
+        }
+
+        // Send DELETE request to WHIP session resource URL to cleanup server resources.
+        if (self.resourceUrl) {
+            const xhr = new XMLHttpRequest();
+            xhr.open('DELETE', self.resourceUrl, true);
+            xhr.onload = function() {
+                if (xhr.readyState !== xhr.DONE) return;
+                if (xhr.status === 200) {
+                    console.log(`WHIP session deleted: ${self.resourceUrl}`);
+                } else {
+                    console.warn(`Failed to delete WHIP session: ${self.resourceUrl}, status: ${xhr.status}`);
+                }
+            };
+            xhr.onerror = function() {
+                console.warn(`Error deleting WHIP session: ${self.resourceUrl}`);
+            };
+            xhr.send();
+            self.resourceUrl = null;
+        }
+    };
+
+    // The callback when got local stream.
+    // @see https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/addStream#Migrating_to_addTrack
+    self.ontrack = function (event) {
+        // Add track to stream of SDK.
+        self.stream.addTrack(event.track);
+    };
+
+    self.pc = new RTCPeerConnection(null);
+
+    // To keep api consistent between player and publisher.
+    // @see https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/addStream#Migrating_to_addTrack
+    // @see https://webrtc.org/getting-started/media-devices
+    self.stream = new MediaStream();
+
+    // Internal APIs.
+    self.__internal = {
+        parseId: (url, offer, answer) => {
+            let sessionid = offer.substr(offer.indexOf('a=ice-ufrag:') + 'a=ice-ufrag:'.length);
+            sessionid = sessionid.substr(0, sessionid.indexOf('\n') - 1) + ':';
+            sessionid += answer.substr(answer.indexOf('a=ice-ufrag:') + 'a=ice-ufrag:'.length);
+            sessionid = sessionid.substr(0, sessionid.indexOf('\n'));
+
+            const a = document.createElement("a");
+            a.href = url;
+            return {
+                sessionid: sessionid, // Should be ice-ufrag of answer:offer.
+                simulator: a.protocol + '//' + a.host + '/rtc/v1/nack/',
+            };
+        },
+        filterCodec: (sdp, vcodec, acodec) => {
+            // Filter video codec if specified
+            if (vcodec) {
+                const vcodecUpper = vcodec.toUpperCase();
+                sdp = sdp.split('\n').filter(line => {
+                    // Keep all non-video lines
+                    if (!line.startsWith('a=rtpmap:') && !line.startsWith('a=rtcp-fb:') &&
+                        !line.startsWith('a=fmtp:')) {
+                        return true;
+                    }
+                    // For video codec lines, only keep the specified codec
+                    if (line.includes('video/')) {
+                        return line.toUpperCase().includes(vcodecUpper);
+                    }
+                    return true;
+                }).join('\n');
+            }
+
+            // Filter audio codec if specified
+            if (acodec) {
+                const acodecUpper = acodec.toUpperCase();
+                sdp = sdp.split('\n').filter(line => {
+                    // Keep all non-audio lines
+                    if (!line.startsWith('a=rtpmap:') && !line.startsWith('a=rtcp-fb:') &&
+                        !line.startsWith('a=fmtp:')) {
+                        return true;
+                    }
+                    // For audio codec lines, only keep the specified codec
+                    if (line.includes('audio/')) {
+                        return line.toUpperCase().includes(acodecUpper);
+                    }
+                    return true;
+                }).join('\n');
+            }
+
+            return sdp;
+        },
+    };
+
+    // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/ontrack
+    self.pc.ontrack = function(event) {
+        if (self.ontrack) {
+            self.ontrack(event);
+        }
+    };
+
+    return self;
+}
+
+// https://developer.mozilla.org/en-US/docs/Web/API/RTCStatsReport
+function SrsRtcFormatStats(stats, kind) {
+    var codecs = [];
+    stats.forEach((report) => {
+        if (report.type === 'codec' && report.mimeType?.toLowerCase().startsWith(kind)) {
+            var s = '';
+
+            s += report.mimeType.split('/')[1] || report.mimeType;
+            
+            if (report.clockRate) {
+                s += ', ' + report.clockRate + 'HZ';
+            }
+
+            if (kind === 'audio' && report.channels) {
+                s += ', channels: ' + report.channels;
+            }
+            
+            if (report.payloadType) {
+                s += ', pt: ' + report.payloadType;
+            }
+            
+            codecs.push(s);
+        }
+    });
+    return codecs.join(", ");
+}

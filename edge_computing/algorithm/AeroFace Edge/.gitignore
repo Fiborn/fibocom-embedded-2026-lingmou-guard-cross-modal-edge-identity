@@ -1,0 +1,6 @@
+.env
+data/
+facedata/
+*.log
+__pycache__/
+*.py[cod]
